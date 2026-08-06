@@ -20,6 +20,7 @@ from app.config import (
     SEARCH_LIMIT,
     EMBEDDING_PROVIDER,
     CANDIDATE_POOL_SIZE,
+    OPENAI_API_KEY,
 )
 from app.embeddings import get_embedding
 from app.query_parser import prepare_search_query
@@ -30,7 +31,24 @@ EMBEDDING_COLUMN = "embedding" if EMBEDDING_PROVIDER == "openai" else "embedding
 logger = logging.getLogger(__name__)
 
 engine = create_engine(DATABASE_URL)
-_client = wrap_openai(OpenAI())
+_openai_client: OpenAI | None = None
+
+
+def _get_openai_client() -> OpenAI:
+    """Build the OpenAI client lazily on first use.
+
+    Raises:
+        RuntimeError: If called without OPENAI_API_KEY set.
+    """
+    global _openai_client
+    if _openai_client is None:
+        if not OPENAI_API_KEY:
+            raise RuntimeError(
+                "OPENAI_API_KEY environment variable is not set. "
+                "Create a .env file with your API key."
+            )
+        _openai_client = wrap_openai(OpenAI())
+    return _openai_client
 
 
 @retry(
@@ -70,7 +88,7 @@ CARDS FOUND:
 
     logger.debug("=== PROMPT SENT TO MODEL ===\n%s\n=== END PROMPT ===", prompt)
 
-    response = _client.chat.completions.create(
+    response = _get_openai_client().chat.completions.create(
         model=CHAT_MODEL,
         messages=[
             {"role": "system", "content": prompt},
@@ -144,7 +162,10 @@ def search_card(
             candidate_pool_size=candidate_pool_size,
         )
         results = rerank(search_query, candidates, SEARCH_LIMIT)
-        model_answer = get_model_answer(query, results)
+        if OPENAI_API_KEY:
+            model_answer = get_model_answer(query, results)
+        else:
+            model_answer = None
 
     print(f"\n🏆 Top {len(results)} Results:\n")
     for i, row in enumerate(results, 1):
@@ -152,7 +173,8 @@ def search_card(
         print(f"   {row['content']}")
         print("-" * 60)
 
-    print(f"\n💡 AI Answer:\n{model_answer}\n")
+    if model_answer is not None:
+        print(f"\n💡 AI Answer:\n{model_answer}\n")
 
 
 def interactive_loop() -> None:

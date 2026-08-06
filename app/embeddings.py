@@ -142,27 +142,6 @@ def get_embedding(text: str) -> list[float]:
     return _get_local_embedding(text)
 
 
-def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
-    """Generate embeddings for multiple texts in a single call.
-
-    Uses OpenAI if OPENAI_API_KEY is set, otherwise uses a local
-    SentenceTransformer model.
-
-    Args:
-        texts: List of text strings.
-
-    Returns:
-        List of embedding vectors, same order as input.
-
-    Raises:
-        RuntimeError: If using OpenAI and OPENAI_API_KEY is not set.
-        openai.APIError: If the OpenAI API request fails.
-    """
-    if EMBEDDING_PROVIDER == "openai":
-        return _get_openai_embeddings_batch(texts)
-    return _get_local_embeddings_batch(texts)
-
-
 def get_both_embeddings(
     text: str,
 ) -> tuple[list[float] | None, list[float] | None]:

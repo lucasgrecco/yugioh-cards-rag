@@ -21,6 +21,13 @@ dependencies = [
 [project.scripts]
 ygo-search = "app.mcp_server:main"
 
+[dependency-groups]
+# `tests/` existia sem runner declarado: nenhum venv tinha pytest, e `uv sync` poda o
+# que não está aqui — instalar à mão não sobrevive ao próximo sync.
+dev = [
+    "pytest>=8",
+]
+
 [tool.uv]
 package = true
 

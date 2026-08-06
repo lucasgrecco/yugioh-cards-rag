@@ -21,7 +21,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
 
-from sqlalchemy import create_engine, delete
+from sqlalchemy import create_engine, delete, select
 from sqlalchemy.orm import sessionmaker
 
 from app.config import DATABASE_URL, DEFAULT_JSON_DIR
@@ -34,8 +34,17 @@ logger = logging.getLogger(__name__)
 class CardFileHandler(FileSystemEventHandler):
     """Handles file system events for card JSON files."""
 
-    def __init__(self, session_factory: sessionmaker) -> None:
+    def __init__(
+        self,
+        session_factory: sessionmaker,
+        watched_dir: str | Path,
+    ) -> None:
         self.session_factory = session_factory
+        # resolve() once: watchdog event paths are absolute, and the containment
+        # check compares resolved paths. Note: resolve() follows symlinks, so a
+        # symlink inside the tree that resolves outside flips the decision
+        # (accepted per spec).
+        self.watched_dir = Path(watched_dir).resolve()
         self._last_event: dict[tuple[str, str], float] = {}
         self._debounce_seconds = 0.5
         self._max_file_size = 50 * 1024  # 50 KB max per JSON file
@@ -48,6 +57,10 @@ class CardFileHandler(FileSystemEventHandler):
         if path.name.startswith("."):
             return False
         return True
+
+    def _is_inside_watched_tree(self, path: str) -> bool:
+        """Return True if the path is inside the watched tree."""
+        return Path(path).resolve().is_relative_to(self.watched_dir)
 
     def _debounce(self, file_path: str, event_type: str) -> bool:
         """Return True if this event should be processed (not a duplicate).
@@ -85,25 +98,49 @@ class CardFileHandler(FileSystemEventHandler):
     def on_moved(self, event: object) -> None:
         """Handle file renames and moves between directories."""
         if event.is_directory:
+            # Directory moved into the watched tree: ingest its card files
+            if self._is_inside_watched_tree(event.dest_path):
+                if self._debounce(event.dest_path, "moved_in"):
+                    self._ingest_dir(event.dest_path)
+            # Directory moved out of the watched tree: reconcile (delete absent)
+            else:
+                if self._debounce(event.src_path, "moved_out"):
+                    self._reconcile()
             return
-        # File moved into the watched directory: treat as created
-        if self._should_process(event.dest_path):
+        # File moved into the watched tree: treat as created
+        if self._should_process(event.dest_path) and self._is_inside_watched_tree(
+            event.dest_path
+        ):
             if self._debounce(event.dest_path, "created"):
                 self._handle_change(event.dest_path)
-        # File moved out of the watched directory: treat as deleted
-        if self._should_process(event.src_path):
+        # File moved out of the watched tree: treat as deleted
+        elif self._should_process(event.src_path):
             if self._debounce(event.src_path, "deleted"):
                 self._handle_delete(event.src_path)
 
     def on_deleted(self, event: object) -> None:
-        if event.is_directory or not self._should_process(event.src_path):
+        if event.is_directory:
+            # Directory deleted: reconcile (delete cards whose files are gone)
+            if self._debounce(event.src_path, "deleted_dir"):
+                self._reconcile()
+            return
+        if not self._should_process(event.src_path):
             return
         self._handle_delete(event.src_path)
 
     def _handle_change(self, file_path: str) -> None:
         """Read JSON file, generate embedding, and upsert into the database."""
         path = Path(file_path)
-        if path.stat().st_size > self._max_file_size:
+        try:
+            file_size = path.stat().st_size
+        except OSError as e:
+            logger.warning(
+                "Failed to stat %s (file may have been deleted): %s",
+                file_path,
+                e,
+            )
+            return
+        if file_size > self._max_file_size:
             logger.warning("Skipping large file: %s", file_path)
             return
 
@@ -159,6 +196,43 @@ class CardFileHandler(FileSystemEventHandler):
                 )
                 session.rollback()
 
+    def _reconcile(self) -> set[int]:
+        """Delete DB cards whose JSON files are no longer in the watched tree.
+
+        Returns the set of deleted card_json_ids (empty if none).
+        """
+        present = {
+            int(p.stem)
+            for p in self.watched_dir.rglob("*.json")
+            if not p.name.startswith(".") and p.stem.isdigit()
+        }
+        with self.session_factory() as session:
+            try:
+                existing = set(session.scalars(select(Card.card_json_id)).all())
+                to_delete = existing - present
+                if to_delete:
+                    session.execute(
+                        delete(Card).where(Card.card_json_id.in_(to_delete))
+                    )
+                    session.commit()
+                    logger.info(
+                        "Reconciliation: deleted %d card(s) absent from the "
+                        "watched tree: %s",
+                        len(to_delete),
+                        sorted(to_delete),
+                    )
+                return to_delete
+            except Exception:
+                logger.exception("Reconciliation failed")
+                session.rollback()
+                return set()
+
+    def _ingest_dir(self, dir_path: str) -> None:
+        """Walk a directory moved into the watched tree and upsert each card file."""
+        for p in sorted(Path(dir_path).rglob("*.json")):
+            if self._should_process(str(p)):
+                self._handle_change(str(p))
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -195,8 +269,8 @@ def main() -> None:
 
     observer_cls = PollingObserver if args.polling else Observer
     observer = observer_cls()
-    handler = CardFileHandler(session_factory)
-    observer.schedule(handler, str(json_dir), recursive=False)
+    handler = CardFileHandler(session_factory, json_dir)
+    observer.schedule(handler, str(json_dir), recursive=True)
 
     def shutdown(signum: int, frame: object) -> None:
         logger.info("Shutting down watcher (signal %d)...", signum)
